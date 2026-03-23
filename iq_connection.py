@@ -23,6 +23,68 @@ class IQOptionConnector:
         self.connected = False
         self.account_type = config.ACCOUNT_TYPE
 
+    @staticmethod
+    def _patch_digital_open(api_instance):
+        """
+        Aplica un monkey-patch al metodo __get_digital_open de la API
+        para evitar el KeyError 'underlying' que ocurre en un hilo de fondo.
+        La libreria iqoptionapi lanza este hilo automaticamente al conectarse
+        y falla porque IQ Option cambio el formato de respuesta de su API.
+        """
+        try:
+            def safe_get_digital_open(self_api):
+                try:
+                    digital_data = self_api.get_digital_underlying_list_data()
+                    if not isinstance(digital_data, dict):
+                        return
+                    underlying = digital_data.get("underlying")
+                    if underlying is None:
+                        return
+                    for data in underlying:
+                        active_id = data.get("active_id")
+                        if active_id is None:
+                            continue
+                        is_suspended = data.get("is_suspended", True)
+                        name = data.get("name", "")
+                        schedule = data.get("schedule", [])
+                        if hasattr(self_api, "digital_option_open_data"):
+                            self_api.digital_option_open_data[active_id] = {
+                                "open": not is_suspended,
+                                "name": name,
+                                "schedule": schedule,
+                            }
+                except (KeyError, TypeError, AttributeError) as e:
+                    logger.debug(
+                        "Patch __get_digital_open: error ignorado: %s", e
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Patch __get_digital_open: error inesperado: %s", e
+                    )
+
+            # El metodo tiene name mangling por ser __get_digital_open
+            patched_name = "_IQ_Option__get_digital_open"
+            if hasattr(api_instance, patched_name):
+                import types
+                api_instance.__get_digital_open = types.MethodType(
+                    safe_get_digital_open, api_instance
+                )
+                setattr(
+                    api_instance,
+                    patched_name,
+                    types.MethodType(safe_get_digital_open, api_instance),
+                )
+                logger.info(
+                    "Patch aplicado a __get_digital_open para evitar "
+                    "KeyError 'underlying'"
+                )
+            else:
+                logger.debug(
+                    "No se encontro __get_digital_open para parchear"
+                )
+        except Exception as e:
+            logger.warning("No se pudo aplicar patch a __get_digital_open: %s", e)
+
     def connect(self):
         """
         Establece conexion con IQ Option.
@@ -35,7 +97,16 @@ class IQOptionConnector:
 
             logger.info("Conectando a IQ Option con %s...", self.email)
             self.api = IQ_Option(self.email, self.password)
+
+            # Aplicar parche ANTES de conectar para evitar el KeyError
+            # 'underlying' en el hilo de fondo __get_digital_open
+            self._patch_digital_open(self.api)
+
             check, reason = self.api.connect()
+
+            # Re-aplicar parche despues de conectar por si la conexion
+            # reinicializa los metodos internos
+            self._patch_digital_open(self.api)
 
             if check:
                 self.connected = True

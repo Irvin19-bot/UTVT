@@ -190,6 +190,9 @@ class IQOptionConnector:
     def check_asset_open(self, asset):
         """
         Verifica si un activo esta disponible para operar.
+        Intenta obtener velas como prueba de disponibilidad,
+        ya que get_all_open_time() tiene un bug conocido con
+        la key 'underlying' en versiones recientes de la API.
 
         Args:
             asset (str): Par de divisas
@@ -201,13 +204,25 @@ class IQOptionConnector:
             return False
 
         try:
-            all_assets = self.api.get_all_open_time()
-            # Verificar en opciones binarias y digitales
-            for option_type in ["turbo", "binary", "digital"]:
-                if option_type in all_assets:
-                    if asset in all_assets[option_type]:
-                        if all_assets[option_type][asset].get("open", False):
-                            return True
+            # Primero intentar get_all_open_time solo para binary/turbo
+            # (evitando digital que causa el KeyError 'underlying')
+            try:
+                all_assets = self.api.get_all_open_time()
+                for option_type in ["turbo", "binary"]:
+                    if option_type in all_assets:
+                        if asset in all_assets[option_type]:
+                            if all_assets[option_type][asset].get("open", False):
+                                return True
+            except (KeyError, Exception) as api_err:
+                logger.debug(
+                    "get_all_open_time fallo para %s: %s. Usando fallback.",
+                    asset, api_err,
+                )
+
+            # Fallback: intentar obtener velas como prueba de disponibilidad
+            candles = self.api.get_candles(asset, 60, 1, time.time())
+            if candles and len(candles) > 0:
+                return True
             return False
         except Exception as e:
             logger.error(
@@ -218,6 +233,8 @@ class IQOptionConnector:
     def get_open_assets(self):
         """
         Obtiene la lista de activos abiertos para operar.
+        Usa multiples estrategias para detectar activos disponibles,
+        con fallback si get_all_open_time() falla.
 
         Returns:
             list: Lista de activos disponibles
@@ -225,20 +242,51 @@ class IQOptionConnector:
         if not self.connected or self.api is None:
             return []
 
+        open_assets = []
+
+        # Estrategia 1: Intentar get_all_open_time (solo binary/turbo)
+        api_assets_loaded = False
         try:
             all_assets = self.api.get_all_open_time()
-            open_assets = []
+            api_assets_loaded = True
             for asset in config.ASSETS:
-                for option_type in ["turbo", "binary", "digital"]:
+                for option_type in ["turbo", "binary"]:
                     if option_type in all_assets:
                         if asset in all_assets[option_type]:
                             if all_assets[option_type][asset].get("open", False):
                                 if asset not in open_assets:
                                     open_assets.append(asset)
-            return open_assets
-        except Exception as e:
-            logger.error("Error al obtener activos abiertos: %s", e)
-            return []
+        except (KeyError, Exception) as e:
+            logger.warning(
+                "get_all_open_time fallo (error conocido): %s. "
+                "Usando verificacion directa por velas.", e
+            )
+
+        # Estrategia 2 (fallback): Verificar cada activo intentando obtener velas
+        if not api_assets_loaded or not open_assets:
+            logger.info(
+                "Verificando activos por obtencion directa de velas..."
+            )
+            for asset in config.ASSETS:
+                if asset in open_assets:
+                    continue
+                try:
+                    candles = self.api.get_candles(asset, 60, 1, time.time())
+                    if candles and len(candles) > 0:
+                        open_assets.append(asset)
+                        logger.info("Activo disponible: %s", asset)
+                except Exception as e:
+                    logger.debug(
+                        "Activo %s no disponible: %s", asset, e
+                    )
+
+        if not open_assets:
+            logger.warning(
+                "No se encontraron activos disponibles de la lista: %s",
+                ", ".join(config.ASSETS),
+            )
+
+        return open_assets
 
     def buy(self, asset, amount, direction, expiration=None):
         """
